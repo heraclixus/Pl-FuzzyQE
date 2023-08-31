@@ -63,7 +63,7 @@ def parse_args(args=None):
 
     parser.add_argument('--tasks', default='1p.2p.3p.2i.3i.ip.pi.2in.3in.inp.pin.pni.2u.up', type=str, help="tasks connected by dot, refer to the BetaE paper for detailed meaning and structure of each task")
     parser.add_argument('--seed', default=0, type=int, help="random seed")
-    parser.add_argument('-betam', '--beta_mode', default="(1600,2)", type=str, help='(hidden_dim,num_layer) for BetaE relational projection')
+    parser.add_argument('-betam', '--beta_mode', default="(1600,3)", type=str, help='(hidden_dim,num_layer) for BetaE relational projection')
     parser.add_argument('-boxm', '--box_mode', default="(none,0.02)", type=str, help='(offset activation,center_reg) for Query2box, center_reg balances the in_box dist and out_box dist')
     parser.add_argument('--prefix', default=None, type=str, help='prefix of the log path')
     parser.add_argument('--checkpoint_path', default=None, type=str, help='path for loading the checkpoints')
@@ -140,6 +140,11 @@ def parse_args(args=None):
     parser.add_argument('--no_anchor_reg', action='store_true', help='no anchor entity regularizer')
     parser.add_argument('--share_relation_bias', action='store_true', help='share relation bias')
 
+
+    # partition-based fuzzy set 
+    # this corresponds to the hidden_dim parameter before, but now with different interpretation/meaning
+    parser.add_argument("--n_partitions", default=100, type=int)
+    parser.add_argument("--strict_partition", action="store_false", help="determines whether map + projection are dimension-wise only")
 
     return parser.parse_args(args)
 
@@ -382,14 +387,14 @@ def main(args):
                 print(f'Time to train {args.log_steps} step: {time.time() - time0:.2f}')
 
                 # # debug parameter change
-                # if args.projection_type == 'mlp':
-                #     wandb.log({
-                #         'projection_layer00': model.projection_net.layer0.weight[0,0]
-                #     })
-                # if args.regularizer == 'sigmoid':
-                #     wandb.log({
-                #         'conjunction_regularizer': model.conjunction_net.regularizer.weight[0]
-                #     })
+                if args.projection_type == 'mlp':
+                    wandb.log({
+                        'projection_layer00': model.projection_net.layer0.weight[0,0]
+                    })
+                if args.regularizer == 'sigmoid':
+                    wandb.log({
+                        'conjunction_regularizer': model.conjunction_net.regularizer.weight[0]
+                    })
 
                 cur_lr = optimizer.param_groups[0]['lr']
                 # print('Change learning_rate to %f at step %d' % (current_learning_rate, step))

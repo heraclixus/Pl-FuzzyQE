@@ -61,8 +61,8 @@ def read_num_entity_relation_from_file(data_path):
 
 def wandb_initialize(config_dict):
     return wandb.init(
-        project="kgfolreasoning",
-        entity='kgfol',
+        project="pl-fuzzyset",
+        entity='fredxu',
         config=config_dict
     )
 

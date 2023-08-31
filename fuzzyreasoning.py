@@ -42,6 +42,9 @@ class KGFuzzyReasoning(KGReasoning):
         self.entity_dim = hidden_dim
 
         self.no_anchor_reg = args.no_anchor_reg
+        
+        # PL-Fuzzyset
+        self.n_partitions = args.n_partitions
 
 
         if args.load_pretrained == True:
@@ -96,7 +99,8 @@ class KGFuzzyReasoning(KGReasoning):
             projection_dim,
             num_layers,
             projection_type,
-            num_rel_base=args.num_rel_base
+            num_rel_base=args.n_partitions,
+            n_partitions=self.n_partitions,
         )
 
         self.conjunction_net = Conjunction(self.entity_dim, logic_type, regularizer_setting, use_attention=args.use_attention, godel_gumbel_beta=godel_gumbel_beta)
@@ -189,6 +193,10 @@ class KGFuzzyReasoning(KGReasoning):
         if subsampling_weight is not None:
             subsampling_weight = subsampling_weight[all_idxs]
 
+        """
+        positive samples handling
+        """
+
         if positive_sample is not None:
             if len(all_embeddings) > 0:
                 # positive samples for non-union queries in this batch
@@ -222,6 +230,9 @@ class KGFuzzyReasoning(KGReasoning):
         if negative_sample is None:
             negative_score = None
         else:
+            """
+            handling negative samples 
+            """
             if len(all_embeddings) > 0:
                 negative_sample_regular = negative_sample[all_idxs]
 
@@ -675,6 +686,20 @@ class KGFuzzyReasoning(KGReasoning):
         optimizer.zero_grad()
 
         positive_sample, negative_sample, subsampling_weight, batch_queries, query_structure_idxs = next(train_iterator)
+
+        # TODO: temporary, check what the minibatch looks like 
+        # logging.info(f"training: positive_sample = {positive_sample}")
+        # logging.info("-----------------------------------------------------")
+        # logging.info(f"training: negative_sample = {negative_sample}")
+        # logging.info("-----------------------------------------------------")
+        # logging.info(f"training: subsampling_weight = {subsampling_weight}")
+        # logging.info("-----------------------------------------------------")
+        # logging.info(f"training: batch_queries = {batch_queries}")
+        # logging.info("-----------------------------------------------------")
+        # logging.info(f"training: query_structure_idxs = {query_structure_idxs}")
+        # logging.info("-----------------------------------------------------")
+        # exit(0)
+
 
         if args.cuda:
             positive_sample = positive_sample.to(device)

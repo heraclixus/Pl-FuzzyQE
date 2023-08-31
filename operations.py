@@ -2,137 +2,195 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from util import get_regularizer
+from models import SimpleMLP
 
-class Projection(nn.Module):
-    # def __init__(self, entity_dim, logic_type, regularizer_setting):
+
+"""
+Entity mapping: takes entity embeddings and map them into a PL-Fuzzy set in [0,1]^d
+"""
+class EntityMapping(nn.Module):
+    def __init__(self, entity_dim, hidden_dim, 
+                 num_hidden_layers,
+                 regularizer_setting,
+                 n_partitions):
+        super(EntityMapping, self).__init__()
+        self.entity_dim = entity_dim
+        self.hidden_dim = hidden_dim
+        self.num_hidden_layers = num_hidden_layers
+        self.regularizer = regularizer_setting
+        self.n_partitions = n_partitions
+        
+        self.pl_fuzzyset_maps = nn.ModuleList([
+            SimpleMLP(input_dim=self.entity_dim, hidden_dim=self.hidden_dim,
+                      num_hidden_layers=self.num_hidden_layers, regularizer=self.regularizer)
+            for _ in range(self.n_partitions)])
+        
+    def forward(self, e_embedding):
+        pl_fuzzyset = []
+        for i in range(self.n_partitions):
+            pl_fuzzyset_i = self.pl_fuzzyset_maps[i](e_embedding)
+            pl_fuzzyset.append(pl_fuzzyset_i) # (B,1)
+        return torch.stack(pl_fuzzyset).squeeze().T
+    
+
+"""
+For better Debugging purpose, write two classes
+Projection MLP is used to perform projection using partitionwise-MLPs
+"""
+class ProjectionMLP(nn.Module):
     def __init__(
             self,
             nrelation,
-            entity_dim,
-            logic_type,
+            regularizer_setting,
+            relation_dim,
+            num_layers,
+            projection_dim,
+            n_partitions, # for plfuzzyset
+            strict_partition, # for plfuzzy set
+    ):
+        super(Projection, self).__init__()
+        self.regularizer = get_regularizer(regularizer_setting, n_partitions, neg_input_possible=True)
+        self.relation_dim = relation_dim # TODO: should relation_dim = n_partitions? 
+        self.strict_partition = strict_partition
+        self.mlp_hidden_dim = projection_dim // n_partitions  # TODO: one degree of freedom
+        self.n_partitions = n_partitions
+        self.num_layers = num_layers
+        # mlp
+        # partition vs. non-partition
+        self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.relation_dim))  # same dim
+        nn.init.uniform_(tensor=self.relation_embedding, a=0, b=1)
+
+        input_dim = 1 + self.relation_dim if self.strict_partition else self.n_partitions + self.relation_dim
+
+        # one MLP for each partition
+        # input as the concatenation of a plfuzzy set and r 
+        # here the input_dim can be (a) n_partitions + relation_dim, or (b) 1 + relational_dim
+        self.MLPs = nn.ModuleList([SimpleMLP(input_dim=input_dim,
+                                             hidden_dim=self.mlp_hidden_dim, 
+                                             num_hidden_layers=self.num_layers,
+                                             regularizer=self.regularizer)
+                                   for i in range(self.n_partitions)])
+
+    def forward(self, e_pl_fuzzyset, rid):
+        r_embedding = torch.index_select(self.relation_embedding, dim=0, index=rid)
+        print(r_embedding.shape)
+        print(e_pl_fuzzyset.shape)
+        plfuzzy_set = []
+        for i in range(len(self.MLPs)):
+            if self.strict_partition:
+                plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset[i], r_embedding],dim=-1))
+            else: 
+                plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset, r_embedding], dim=-1))
+            plfuzzy_set.append(plfuzzy_set_i) 
+        plfuzzy_set = torch.stack(plfuzzy_set).squeeze().T  #(B, d)
+        return plfuzzy_set
+
+
+"""
+The relational basis formulation for projection 
+"""
+class ProjectionRelBasis(nn.Module):
+    def __init__(
+            self,
+            nrelation,
+            regularizer_setting,
+            relation_dim,
+            n_partitions, # for plfuzzyset
+    ):
+        super(Projection, self).__init__()
+        self.regularizer = get_regularizer(regularizer_setting, n_partitions, neg_input_possible=True)
+        self.relation_dim = relation_dim
+        self.dual = regularizer_setting['dual']
+        self.n_partitions = n_partitions
+
+        # partition  vs. non-partition
+        n_base = n_partitions
+        if not self.dual:
+            self.hidden_dim = n_partitions
+            self.rel_base = nn.Parameter(torch.zeros(n_partitions, self.hidden_dim, self.hidden_dim))
+            self.rel_bias = nn.Parameter(torch.zeros(n_partitions, self.hidden_dim))
+            self.rel_att = nn.Parameter(torch.zeros(nrelation, n_base))
+            self.norm = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
+
+            # new initialization
+            torch.nn.init.orthogonal_(self.rel_base)
+            torch.nn.init.xavier_normal_(self.rel_bias)
+            torch.nn.init.xavier_normal_(self.rel_att)
+
+        else:
+            self.hidden_dim = self.n_partitions // 2
+
+            # for property vals
+            self.rel_base1 = nn.Parameter(torch.randn(n_base, self.hidden_dim, self.hidden_dim))
+            nn.init.uniform_(self.rel_base1, a=0, b=1e-2)
+            self.rel_bias1 = nn.Parameter(torch.zeros(nrelation, self.hidden_dim))
+            self.rel_att1 = nn.Parameter(torch.randn(nrelation, n_base))
+            self.norm1 = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
+
+            # for property weights
+            self.rel_base2 = nn.Parameter(torch.randn(n_base, self.hidden_dim, self.hidden_dim))
+            nn.init.uniform_(self.rel_base2, a=0, b=1e-2)
+            self.rel_bias2 = nn.Parameter(torch.zeros(nrelation, self.hidden_dim))
+            self.rel_att2 = nn.Parameter(torch.randn(nrelation, n_base))
+            self.norm2 = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
+
+
+    def forward(self, e_pl_fuzzyset, rid):
+        if not self.dual:
+            project_r = torch.einsum('br,rio->bio', self.rel_att[rid], self.rel_base)
+            if self.rel_bias.shape[0] == self.rel_base.shape[0]:
+                bias = torch.einsum('br,ri->bi', self.rel_att[rid], self.rel_bias)
+            else:
+                bias = self.rel_bias[rid]
+            output = torch.einsum('bio,bi->bo', project_r, e_pl_fuzzyset) + bias
+            output = self.norm(output)
+        else:
+            e_embedding1, e_embedding2 = torch.chunk(e_pl_fuzzyset, 2, dim=-1)
+            project_r1 = torch.einsum('br,rio->bio', self.rel_att1[rid], self.rel_base1)
+            bias1 = self.rel_bias1[rid]
+            output1 = torch.einsum('bio,bi->bo', project_r1, e_embedding1) + bias1
+            output1 = self.norm1(output1)
+
+            project_r2 = torch.einsum('br,rio->bio', self.rel_att2[rid], self.rel_base2)
+            bias2 = self.rel_bias2[rid]
+            output2 = torch.einsum('bio,bi->bo', project_r2, e_embedding2) + bias2
+            output2 = self.norm1(output2)
+
+            output = torch.cat((output1, output2), dim=-1)
+
+        output = self.regularizer(output)
+        return output
+
+
+
+"""
+a wrapper class around the above two projection types
+"""
+class Projection(nn.Module):
+    def __init__(
+            self,
+            nrelation,
             regularizer_setting,
             relation_dim,
             projection_dim,
             num_layers,
             projection_type,
-            num_rel_base,  # for 'rtransform'
+            n_partitions, # for plfuzzyset
+            strict_partition, # for plfuzzy set
     ):
         super(Projection, self).__init__()
-        self.logic = logic_type
 
-        # # temporary testing
-        # regularizer_setting = {
-        #         'type': 'sigmoid',
-        #     }
-
-        self.regularizer = get_regularizer(regularizer_setting, entity_dim, neg_input_possible=True)
-        # for projection
-        self.entity_dim = entity_dim
-        self.relation_dim = relation_dim
-        self.projection_type = projection_type
-
-        self.dual = regularizer_setting['dual']
-
-
-        # mlp
+      
         if projection_type == 'mlp':
-            self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.entity_dim))  # same dim
-            nn.init.uniform_(tensor=self.relation_embedding, a=0, b=1)
+            self.projection_net = ProjectionMLP(nrelation=nrelation, regularizer_setting=regularizer_setting, 
+                                                relation_dim=relation_dim, num_layers=num_layers,
+                                                projection_dim=projection_dim, n_partitions=n_partitions, strict_partition=strict_partition)
+        else:
+            self.projection_net = ProjectionRelBasis(nrelation=nrelation, regularizer_setting=regularizer_setting, 
+                                                     relation_dim=relation_dim, n_partitions=n_partitions)
 
-            # mlp
-            self.hidden_dim = projection_dim
-            self.num_layers = num_layers
-            self.layer1 = nn.Linear(self.entity_dim + self.relation_dim, self.hidden_dim)  # 1st layer
-            self.layer0 = nn.Linear(self.hidden_dim, self.entity_dim)  # final layer
-            for nl in range(2, num_layers + 1):
-                setattr(self, "layer{}".format(nl), nn.Linear(self.hidden_dim, self.hidden_dim))
-            for nl in range(num_layers + 1):
-                nn.init.xavier_uniform_(getattr(self, "layer{}".format(nl)).weight)
-        elif projection_type == 'rtransform':
-            n_base = num_rel_base
-            if not self.dual:
-                self.hidden_dim = entity_dim
-                self.rel_base = nn.Parameter(torch.zeros(n_base, self.hidden_dim, self.hidden_dim))
-                # nn.init.uniform_(self.rel_base, a=0, b=1e-2)
-                self.rel_bias = nn.Parameter(torch.zeros(n_base, self.hidden_dim))
-                self.rel_att = nn.Parameter(torch.zeros(nrelation, n_base))
-                self.norm = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
-
-                # new initialization
-                torch.nn.init.orthogonal_(self.rel_base)
-                torch.nn.init.xavier_normal_(self.rel_bias)
-                torch.nn.init.xavier_normal_(self.rel_att)
-
-            else:
-                self.hidden_dim = entity_dim//2
-
-                # for property vals
-                self.rel_base1 = nn.Parameter(torch.randn(n_base, self.hidden_dim, self.hidden_dim))
-                nn.init.uniform_(self.rel_base1, a=0, b=1e-2)
-                self.rel_bias1 = nn.Parameter(torch.zeros(nrelation, self.hidden_dim))
-                self.rel_att1 = nn.Parameter(torch.randn(nrelation, n_base))
-                self.norm1 = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
-
-                # for property weights
-                self.rel_base2 = nn.Parameter(torch.randn(n_base, self.hidden_dim, self.hidden_dim))
-                nn.init.uniform_(self.rel_base2, a=0, b=1e-2)
-                self.rel_bias2 = nn.Parameter(torch.zeros(nrelation, self.hidden_dim))
-                self.rel_att2 = nn.Parameter(torch.randn(nrelation, n_base))
-                self.norm2 = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
-        elif projection_type == 'transe':
-            self.hidden_dim = entity_dim
-            self.rel_trans = nn.Parameter(torch.zeros(nrelation, self.hidden_dim))
-            self.rel_bias = nn.Parameter(torch.zeros(nrelation, self.hidden_dim))
-            torch.nn.init.xavier_normal_(self.rel_trans)
-            torch.nn.init.xavier_normal_(self.rel_bias)
-            self.norm = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
-
-
-
-    def forward(self, e_embedding, rid):
-        if self.projection_type == 'mlp':
-            r_embedding = torch.index_select(self.relation_embedding, dim=0, index=rid)
-            x = torch.cat([e_embedding, r_embedding], dim=-1)
-            for nl in range(1, self.num_layers + 1):
-                x = F.relu(getattr(self, "layer{}".format(nl))(x))
-            x = self.layer0(x)
-            x = self.regularizer(x)
-            return x
-
-        if self.projection_type == 'rtransform':
-            if not self.dual:
-                project_r = torch.einsum('br,rio->bio', self.rel_att[rid], self.rel_base)
-                if self.rel_bias.shape[0] == self.rel_base.shape[0]:
-                    bias = torch.einsum('br,ri->bi', self.rel_att[rid], self.rel_bias)
-                else:
-                    bias = self.rel_bias[rid]
-                output = torch.einsum('bio,bi->bo', project_r, e_embedding) + bias
-                output = self.norm(output)
-            else:
-                e_embedding1, e_embedding2 = torch.chunk(e_embedding, 2, dim=-1)
-                project_r1 = torch.einsum('br,rio->bio', self.rel_att1[rid], self.rel_base1)
-                bias1 = self.rel_bias1[rid]
-                output1 = torch.einsum('bio,bi->bo', project_r1, e_embedding1) + bias1
-                output1 = self.norm1(output1)
-
-                project_r2 = torch.einsum('br,rio->bio', self.rel_att2[rid], self.rel_base2)
-                bias2 = self.rel_bias2[rid]
-                output2 = torch.einsum('bio,bi->bo', project_r2, e_embedding2) + bias2
-                output2 = self.norm1(output2)
-
-                output = torch.cat((output1, output2), dim=-1)
-
-            output = self.regularizer(output)
-            return output
-        
-        if self.projection_type == 'transe':
-            r_trans = torch.index_select(self.rel_trans, dim=0, index=rid)
-            r_bias = torch.index_select(self.rel_bias, dim=0, index=rid)
-            output = e_embedding * r_trans + r_bias
-            
-            output = self.norm(output)
-            output = self.regularizer(output)
-            return output
+    def forward(self, e_pl_fuzzyset, rid):
+        return self.projection_net(e_pl_fuzzyset, rid)
 
 
 

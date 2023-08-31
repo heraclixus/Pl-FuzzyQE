@@ -94,7 +94,7 @@ class TrainDataset(Dataset):
         positive_sample = torch.cat([_[0] for _ in data], dim=0)
         negative_sample = torch.stack([_[1] for _ in data], dim=0)
         subsample_weight = torch.cat([_[2] for _ in data], dim=0)
-        query = np.array([_[3] for _ in data])  # can't convert to tensor due to the varying length
+        query = np.array([_[3] for _ in data], dtype=object)  # can't convert to tensor due to the varying length
         query_structure_idx = np.array([_[4] for _ in data])
         return positive_sample, negative_sample, subsample_weight, query, query_structure_idx
     
@@ -201,6 +201,12 @@ def load_data(args, query_name_dict, tasks):
             else:
                 train_other_queries[query_structure] = train_queries[query_structure]
         train_path_queries = flatten_query_and_convert_structure_to_idx(train_path_queries, query_structure2idx)
+        
+        # TODO: temporary logging for debugging
+        # with open("train_path_query.txt", "w") as f:
+        #     for path_query in train_path_queries:
+        #         f.write(f"{path_query}\n")
+        
         train_path_iterator = SingledirectionalOneShotIterator(DataLoader(
             TrainDataset(train_path_queries, args.nentity, args.nrelation, args.negative_sample_size, train_answers),
             batch_size=args.batch_size,
@@ -210,6 +216,12 @@ def load_data(args, query_name_dict, tasks):
         ))
         if len(train_other_queries) > 0:
             train_other_queries = flatten_query_and_convert_structure_to_idx(train_other_queries, query_structure2idx)
+            
+            # TODO: temporary logging for debugging
+            # with open("train_other_query.txt", "w") as f:
+            #     for other_query in train_other_queries:
+            #         f.write(f"{other_query}\n")
+        
             train_other_iterator = SingledirectionalOneShotIterator(DataLoader(
                 TrainDataset(train_other_queries, args.nentity, args.nrelation, args.negative_sample_size, train_answers),
                 batch_size=args.batch_size,
@@ -225,6 +237,13 @@ def load_data(args, query_name_dict, tasks):
         for query_structure in valid_queries:
             print(query_name_dict[query_structure] + ": " + str(len(valid_queries[query_structure])))
         valid_queries = flatten_query_and_convert_structure_to_idx(valid_queries, query_structure2idx)
+        
+        # TODO: temporary logging for debugging
+        # with open("valid_query.txt", "w") as f:
+        #     for valid_query in valid_queries:
+        #         f.write(f"{valid_query}\n")
+        
+        
         valid_dataloader = DataLoader(
             TestDataset(
                 valid_queries,
@@ -241,6 +260,10 @@ def load_data(args, query_name_dict, tasks):
         for query_structure in test_queries:
             print(query_name_dict[query_structure] + ": " + str(len(test_queries[query_structure])))
         test_queries = flatten_query_and_convert_structure_to_idx(test_queries, query_structure2idx)
+        # TODO: temporary logging for debugging
+        # with open("test_query.txt", "w") as f:
+        #     for test_query in test_queries:
+        #         f.write(f"{test_query}\n")
         test_dataloader = DataLoader(
             TestDataset(
                 test_queries,
