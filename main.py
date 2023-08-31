@@ -145,6 +145,7 @@ def parse_args(args=None):
     # this corresponds to the hidden_dim parameter before, but now with different interpretation/meaning
     parser.add_argument("--n_partitions", default=100, type=int)
     parser.add_argument("--strict_partition", action="store_false", help="determines whether map + projection are dimension-wise only")
+    parser.add_argument("--n_hidden_layers", default=2, type=int) # nlayers for mlp
 
     return parser.parse_args(args)
 

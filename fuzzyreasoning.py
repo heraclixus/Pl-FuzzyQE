@@ -4,7 +4,7 @@ from models import *
 import wandb
 from constants import query_structure_list, query_structure2idx
 from util import get_regularizer
-from operations import Projection, Conjunction, Disjunction, Negation
+from operations import EntityMapping, Projection, Conjunction, Disjunction, Negation
 from gumbel import gumbel_softmax
 import torch.nn.functional as F
 
@@ -87,9 +87,19 @@ class KGFuzzyReasoning(KGReasoning):
         wandb.log({'loss_type': loss_type})
 
         self.godel_gumbel_beta = godel_gumbel_beta
+        
+        # entity map
+        self.entity_map = EntityMapping(
+            entity_dim=self.entity_dim,
+            hidden_dim=hidden_dim,
+            num_hidden_layers=args.n_hidden_layers,
+            regularizer_setting=regularizer_setting,
+            n_partitions=self.n_partitions
+        )
 
         # intersection and projectizAaz<>on
         projection_dim, num_layers = beta_mode
+        num_layers = args.n_hidden_layers
         self.projection_net = Projection(
             nrelation,
             self.entity_dim,
@@ -107,6 +117,10 @@ class KGFuzzyReasoning(KGReasoning):
         self.disjunction_net = Disjunction(self.entity_dim, logic_type, regularizer_setting, godel_gumbel_beta=godel_gumbel_beta)
         self.negation_net = Negation(self.entity_dim, logic_type, regularizer_setting)
 
+        # weight for each partition
+        self.partition_weights = nn.Parameter(torch.ones((self.n_partitions, )))
+        self.partition_weights_softmax = nn.Softmax(dim=-1)
+        
         # gumbel softmax
         self.gumbel_temperature = gumbel_temperature  # used if loss_type == 'gumbel_softmax'
         self.gumbel_attention = args.gumbel_attention if args.gumbel_attention != 'none' else None  # None or 'plain' or 'query_dependent'
@@ -130,7 +144,11 @@ class KGFuzzyReasoning(KGReasoning):
         
 
 
-
+    """
+    forward pass:
+     - entities (positive and negative) are first transformed into PL-Fuzzy sets using the entity mapping layer
+     - scores are then computed using the Possibility of the intersection
+    """
     def forward(
             self,
             positive_sample,
@@ -172,7 +190,7 @@ class KGFuzzyReasoning(KGReasoning):
         # all query embeddings
         # concatenate vectors
         all_idxs = np.concatenate([batch_idxs_dict[query_structure] for query_structure in batch_queries_dict], axis=None)
-        all_embeddings = torch.cat(
+        all_pl_fuzzysets = torch.cat(
             [
                 self.embed_query_fuzzy(
                     batch_queries_dict[query_structure],
@@ -198,7 +216,7 @@ class KGFuzzyReasoning(KGReasoning):
         """
 
         if positive_sample is not None:
-            if len(all_embeddings) > 0:
+            if len(all_pl_fuzzysets) > 0:
                 # positive samples for non-union queries in this batch
                 positive_sample_regular = positive_sample[all_idxs]
                 if self.loss_type.startswith('discrete'):
@@ -219,8 +237,8 @@ class KGFuzzyReasoning(KGReasoning):
                             index=positive_sample_regular
                         ).unsqueeze(1)
                     )
-
-                positive_score = self.cal_logit_fuzzy(positive_embedding, all_embeddings, inference=inference)
+                positive_pl_fuzzyset = self.entity_map(positive_embedding)
+                positive_score = self.cal_logit_fuzzy(positive_pl_fuzzyset, all_pl_fuzzysets, inference=inference)
             else:
                 positive_score = torch.Tensor([]).to(self.device)
 
@@ -233,7 +251,7 @@ class KGFuzzyReasoning(KGReasoning):
             """
             handling negative samples 
             """
-            if len(all_embeddings) > 0:
+            if len(all_pl_fuzzysets) > 0:
                 negative_sample_regular = negative_sample[all_idxs]
 
                 batch_size, negative_size = negative_sample_regular.shape
@@ -263,22 +281,28 @@ class KGFuzzyReasoning(KGReasoning):
                             -1
                         )
                     )
+                negative_pl_fuzzyset = self.entity_map(negative_embedding)
                 # random negative samples
-                negative_score = self.cal_logit_fuzzy(negative_embedding, all_embeddings, inference=inference)
+                negative_score = self.cal_logit_fuzzy(negative_pl_fuzzyset, all_pl_fuzzysets, inference=inference)
             else:
                 negative_score = torch.Tensor([]).to(self.entity_embedding.device)
             
         if self.counter_for_neg and (not inference):
             # add \neg q as a negative sample into training
             emphasize = 16
-            neg_q_embeddings = self.negation_net(all_embeddings)
-            negative_score_2 = self.cal_logit_fuzzy(positive_embedding, neg_q_embeddings, inference=inference)  # [batch_size, 1]
+            neg_q_pl_fuzzysets = self.negation_net(all_pl_fuzzysets)
+            negative_score_2 = self.cal_logit_fuzzy(positive_pl_fuzzyset, neg_q_pl_fuzzysets, inference=inference)  # [batch_size, 1]
             negative_score_2 = negative_score_2.expand(-1, emphasize)
             negative_score = torch.cat((negative_score, negative_score_2), dim=1)
             return positive_score, negative_score, subsampling_weight, all_idxs
         else:
             return positive_score, negative_score, subsampling_weight, all_idxs
 
+    """
+    A query is mapped into a pl-fuzzy set
+    entities -> (entity map) -> pl-fuzzy set 
+    pl-fuzzy-set -> (operators) -> pl-fuzzy set 
+    """
     def embed_query_fuzzy(self, queries, query_structure, idx):
         """
         :param query_structure: e.g. ((('e', ('r',)), ('e', ('r',)), ('u',)), ('r',))
@@ -294,7 +318,7 @@ class KGFuzzyReasoning(KGReasoning):
             if ele not in ['r', 'n']:
                 all_relation_flag = False
                 break
-        if all_relation_flag:  # only relation traversal
+        if all_relation_flag:  # only relation traversal, fuzzy set -> fuzzy set 
             if query_structure[0] == 'e':
                 if self.simplE:
                     # use head embeddings
@@ -311,24 +335,25 @@ class KGFuzzyReasoning(KGReasoning):
                         embedding = self.entity_regularizer(
                             torch.index_select(self.entity_embedding, dim=0, index=queries[:, idx])
                         )
-
+                # convert entity embedding into plfuzzy set
+                entity_pl_fuzzyset = self.entity_map(embedding)
                 idx += 1  # move to next element (next column in queries)
             else:
                 # recursion
-                embedding, idx = self.embed_query_fuzzy(queries, query_structure[0], idx)
+                entity_pl_fuzzyset, idx = self.embed_query_fuzzy(queries, query_structure[0], idx)
 
             for i in range(len(query_structure[-1])):  # query_structure[-1]: ('r', 'n', 'r', ...'r')
                 if query_structure[-1][i] == 'n':  # negation
                     assert (queries[:, idx] == -2).all()
                     # embedding = self.fuzzy_logic.negation(embedding)
-                    embedding = self.negation_net(embedding)
+                    entity_pl_fuzzyset = self.negation_net(entity_pl_fuzzyset)
                 else:
                     rel_indices = queries[:,idx]
                     # embedding = self.fuzzy_logic.projection(embedding, r_embedding)
-                    embedding = self.projection_net(embedding, rel_indices)
+                    entity_pl_fuzzyset = self.projection_net(entity_pl_fuzzyset, rel_indices)
                 idx += 1
         else:
-            subtree_embedding_list = []
+            subtree_pl_fuzzyset_list = []
             if 'u' in query_structure[-1]:  # last one is ('u')
                 # aggregation by disjunction (union)
                 num_subtrees = len(query_structure) - 1  # last one is 'u'
@@ -340,15 +365,15 @@ class KGFuzzyReasoning(KGReasoning):
                 agg_net = self.conjunction_net
 
             for i in range(num_subtrees):
-                subtree_embedding, idx = self.embed_query_fuzzy(queries, query_structure[i], idx)
-                subtree_embedding_list.append(subtree_embedding)
+                subtree_pl_fuzzyset, idx = self.embed_query_fuzzy(queries, query_structure[i], idx)
+                subtree_pl_fuzzyset_list.append(subtree_pl_fuzzyset)
 
-            embedding = agg_net(torch.stack(subtree_embedding_list))
+            result_pl_fuzzyset = agg_net(torch.stack(subtree_pl_fuzzyset_list))
 
             if 'u' in query_structure[-1]:  # move to next
                 idx += 1
 
-        return embedding, idx
+        return result_pl_fuzzyset, idx
 
     def get_distribution_attention(self, query_embedding=None):
         # for gumbel softmax
@@ -362,14 +387,33 @@ class KGFuzzyReasoning(KGReasoning):
 
 
 
-    def cal_logit_fuzzy(self, entity_embedding, query_embedding, inference=False):
+    # override the existing function temporarily
+    """
+    this function follows the possibility computation
+    entity_pl_fuzzyset : (B, n_partitions)
+    query_pl_fuzzyset: (B, n_partitions)
+    """
+    def cal_pl_fuzzy_possibility(self, entity_pl_fuzzyset, query_pl_fuzzyset):
+        intersection_pl_fuzzyset = self.conjunction_net(entity_pl_fuzzyset, query_pl_fuzzyset)
+        partition_weights = self.partition_weights_softmax(self.partition_weights)
+        score = torch.sum(intersection_pl_fuzzyset * partition_weights, dim=-1)
+        return score
+
+    """
+    score in our case is the possibility of a fuzzy set (after intersection)
+    """
+    def cal_logit_fuzzy(self, entity_pl_fuzzyset, query_pl_fuzzyset, inference=False):
         """
         define scoring function for loss
-        :param entity_embedding: shape [batch_size, 1, dim] (positive), [batch_size, num_neg, dim] (negative)
-        :param query_embedding:　shape [batch_size, 1, dim]
+        :param entity_pl_fuzzyset: shape [batch_size, 1, dim] (positive), [batch_size, num_neg, dim] (negative)
+        :param query_pl_fuzzyset:　shape [batch_size, 1, dim]
         :param inference: for discrete case, use soft for training and hard for inference
         :return score: shape [batch_size, 1] for positive, [batch_size, num_neg] for negative
         """
+        # TODO: what does "inference=False" mean? 
+        if self.loss_type == "possibility":
+            return self.cal_pl_fuzzy_possibility(entity_pl_fuzzyset, query_pl_fuzzyset)
+            
         cos = nn.CosineSimilarity(dim=-1)
         if self.loss_type == 'gumbel_softmax':  # regularizer must start with 'matrix'
             # entity embedding has been normalized
@@ -377,23 +421,23 @@ class KGFuzzyReasoning(KGReasoning):
             # not necessarily summing up to 1 if out of logic operations
 
             if self.gumbel_query_unnorm:
-                query_normalized = query_embedding
+                query_normalized = query_pl_fuzzyset
             else:
-                query_normalized = self.entity_regularizer.L1_normalize(query_embedding)  # vector shape
+                query_normalized = self.entity_regularizer.L1_normalize(query_pl_fuzzyset)  # vector shape
 
-            # query_normalized = query_embedding # vector shape
+            # query_normalized = query_pl_fuzzyset # vector shape
             if inference:
                 # hard discrete 
-                entity_one_hot = self.entity_regularizer.hard_discretize(entity_embedding)  # vector shape
+                entity_one_hot = self.entity_regularizer.hard_discretize(entity_pl_fuzzyset)  # vector shape
             else:
                 # convert entity to one-hot vector using gumbel
-                entity_one_hot = self.entity_regularizer.soft_discretize(entity_embedding, self.gumbel_temperature)
+                entity_one_hot = self.entity_regularizer.soft_discretize(entity_pl_fuzzyset, self.gumbel_temperature)
 
             if self.gumbel_attention:
                 entity_one_hot = self.entity_regularizer.reshape_to_matrix(entity_one_hot)
                 query_normalized = self.entity_regularizer.reshape_to_matrix(query_normalized)
                 score = cos(entity_one_hot, query_normalized)
-                distribution_attention = self.get_distribution_attention(query_embedding)
+                distribution_attention = self.get_distribution_attention(query_pl_fuzzyset)
                 score = torch.sum(score * distribution_attention, dim=-1)
             else:
                 # equivalent to torch.sum(entity_one_hot, query_normalized)/constant
@@ -403,16 +447,16 @@ class KGFuzzyReasoning(KGReasoning):
 
         if self.loss_type == 'dot':
             # score = torch.sum(entity_embedding * query_embedding, dim=-1) / math.sqrt(self.entity_dim)  # dot product
-            score = torch.sum(entity_embedding * query_embedding, dim=-1)  # dot product
+            score = torch.sum(entity_pl_fuzzyset * query_pl_fuzzyset, dim=-1)  # dot product
         elif self.loss_type == 'weighted_dot':
             dim_weights = self.dim_weight_softmax(self.dim_weight)
-            score = torch.sum(entity_embedding * query_embedding * dim_weights, dim=-1)
+            score = torch.sum(entity_pl_fuzzyset * query_pl_fuzzyset * dim_weights, dim=-1)
         elif self.loss_type.startswith('discrete'):
             # entity embedding should have been discretized
 
             if self.loss_type == 'discrete_cos':
                 cos = nn.CosineSimilarity(dim=-1)
-                score = cos(entity_embedding, query_embedding)
+                score = cos(entity_pl_fuzzyset, query_pl_fuzzyset)
                 # inference only
                 # thres = 0.7
                 # entity_embedding[entity_embedding >= thres] = 1
@@ -424,17 +468,17 @@ class KGFuzzyReasoning(KGReasoning):
 
                 # For the qth query
                 # unlike other score computation, this score is not aggregated for each sample
-                score = entity_embedding * query_embedding + (1-entity_embedding) * (1-query_embedding)
+                score = entity_pl_fuzzyset * query_pl_fuzzyset + (1-entity_pl_fuzzyset) * (1-query_pl_fuzzyset)
 
         elif self.loss_type == 'entropy':
-            query_embedding = self.entity_regularizer.L1_normalize(query_embedding)  # vector shape
+            query_pl_fuzzyset = self.entity_regularizer.L1_normalize(query_pl_fuzzyset)  # vector shape
 
             # score = torch.mean(query_embedding * torch.log(entity_embedding+eps), dim=-1)
 
             # JSD
-            m = torch.log2((query_embedding + entity_embedding) / 2 + 1e-9)
-            dist = F.kl_div(m, query_embedding.expand(m.shape), reduction="none") \
-                   + F.kl_div(m, entity_embedding,  reduction="none")
+            m = torch.log2((query_pl_fuzzyset + entity_pl_fuzzyset) / 2 + 1e-9)
+            dist = F.kl_div(m, query_pl_fuzzyset.expand(m.shape), reduction="none") \
+                   + F.kl_div(m, entity_pl_fuzzyset,  reduction="none")
             num_distributions = self.entity_regularizer.get_num_distributions()  # entity_dim // k
             dist = 0.5 * torch.sum(dist, dim=-1) / num_distributions
             score = 1 - dist
@@ -443,14 +487,14 @@ class KGFuzzyReasoning(KGReasoning):
             # for Godel only
             # use with sigmoid regularizer
             # L1
-            score = entity_embedding - torch.relu(entity_embedding - query_embedding)
+            score = entity_pl_fuzzyset - torch.relu(entity_pl_fuzzyset - query_pl_fuzzyset)
             score = torch.max(score, dim=-1) 
             # / torch.sum(entity_embedding, dim=-1)
 
         elif self.loss_type == 'weighted_fuzzy_containment':
             # for Godel only, use with sigmoid regularizer
-            entity_vals, entity_val_weights = torch.chunk(entity_embedding, 2, dim=-1)
-            query_vals, query_val_weights = torch.chunk(query_embedding, 2, dim=-1)
+            entity_vals, entity_val_weights = torch.chunk(entity_pl_fuzzyset, 2, dim=-1)
+            query_vals, query_val_weights = torch.chunk(query_pl_fuzzyset, 2, dim=-1)
             val_weights = F.softmax(entity_val_weights * query_val_weights, dim=-1)
 
             score = entity_vals - torch.relu(entity_vals - query_vals)  # containment score
@@ -458,20 +502,20 @@ class KGFuzzyReasoning(KGReasoning):
 
         elif self.loss_type == 'cos_digits':  # use with logsigmoid_bpr_digits
             if not inference:
-                entity_embedding = F.normalize(entity_embedding, p=2, dim=-1)
-                query_embedding = F.normalize(query_embedding, p=2, dim=-1)
-                score_digits = (entity_embedding * query_embedding) * self.entity_dim
+                entity_pl_fuzzyset = F.normalize(entity_pl_fuzzyset, p=2, dim=-1)
+                query_pl_fuzzyset = F.normalize(query_pl_fuzzyset, p=2, dim=-1)
+                score_digits = (entity_pl_fuzzyset * query_pl_fuzzyset) * self.entity_dim
                 # score_digits = score_digits / norm.unsqueeze(2) * self.entity_dim
                 return score_digits  # no aggregation, [batch_size, 1 or num_neg, dim]
 
             # # use cos for inference
             cos = nn.CosineSimilarity(dim=-1)
-            score = cos(entity_embedding, query_embedding)
+            score = cos(entity_pl_fuzzyset, query_pl_fuzzyset)
 
         elif self.loss_type == 'dot_layernorm_digits':  # use with logsigmoid_bpr_digits
-            entity_embedding = self.entity_ln(entity_embedding)
-            query_embedding = self.query_ln(query_embedding)
-            score_digits = (entity_embedding * query_embedding)
+            entity_pl_fuzzyset = self.entity_ln(entity_pl_fuzzyset)
+            query_pl_fuzzyset = self.query_ln(query_pl_fuzzyset)
+            score_digits = (entity_pl_fuzzyset * query_pl_fuzzyset)
             # score_digits = score_digits / norm.unsqueeze(2) * self.entity_dim
             if not inference:
                 return score_digits  # no aggregation, [batch_size, 1 or num_neg, dim]
@@ -480,9 +524,9 @@ class KGFuzzyReasoning(KGReasoning):
 
 
         elif self.loss_type == 'L1_cos_digits':  # use with logsigmoid_avg
-            entity_embedding = F.normalize(entity_embedding, p=1, dim=-1)
-            query_embedding = F.normalize(query_embedding, p=1, dim=-1)
-            score_digits = (entity_embedding * query_embedding) * self.entity_dim
+            entity_pl_fuzzyset = F.normalize(entity_pl_fuzzyset, p=1, dim=-1)
+            query_pl_fuzzyset = F.normalize(query_pl_fuzzyset, p=1, dim=-1)
+            score_digits = (entity_pl_fuzzyset * query_pl_fuzzyset) * self.entity_dim
             # score_digits = score_digits / norm.unsqueeze(2) * self.entity_dim
             if not inference:
                 return score_digits  # no aggregation, [batch_size, 1 or num_neg, dim]
@@ -494,8 +538,8 @@ class KGFuzzyReasoning(KGReasoning):
             # use with godel logic
             # entity_embedding = F.normalize(entity_embedding, p=2, dim=-1)
             # query_embedding = F.normalize(query_embedding, p=2, dim=-1)
-            entity_embedding, query_embedding = torch.broadcast_tensors(entity_embedding, query_embedding)
-            compare = torch.stack((entity_embedding, query_embedding))
+            entity_pl_fuzzyset, query_pl_fuzzyset = torch.broadcast_tensors(entity_pl_fuzzyset, query_pl_fuzzyset)
+            compare = torch.stack((entity_pl_fuzzyset, query_pl_fuzzyset))
             # a smooth way to compute min
             score_digits = -self.godel_gumbel_beta * torch.logsumexp(
                 -compare / self.godel_gumbel_beta, 0
@@ -507,15 +551,15 @@ class KGFuzzyReasoning(KGReasoning):
             # score = torch.logsumexp(-score_digits, dim=-1)
 
         elif self.loss_type == 'entity_multinomial_dot':
-            entity_embedding = F.normalize(entity_embedding, p=1, dim=-1)
-            score = torch.sum(entity_embedding * query_embedding, dim=-1)
+            entity_pl_fuzzyset = F.normalize(entity_pl_fuzzyset, p=1, dim=-1)
+            score = torch.sum(entity_pl_fuzzyset * query_pl_fuzzyset, dim=-1)
 
         elif self.loss_type == 'normalized_entity_dot':
-            score = torch.sum(entity_embedding * query_embedding, dim=-1)
+            score = torch.sum(entity_pl_fuzzyset * query_pl_fuzzyset, dim=-1)
 
         else:  # cos by default
             cos = nn.CosineSimilarity(dim=-1)
-            score = cos(entity_embedding, query_embedding)
+            score = cos(entity_pl_fuzzyset, query_pl_fuzzyset)
         return score
 
     @staticmethod
