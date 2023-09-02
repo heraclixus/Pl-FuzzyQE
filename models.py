@@ -711,7 +711,6 @@ class SimpleMLP(nn.Module):
         self.layer0 = nn.Linear(self.hidden_dim, 1)  # final projection
         
         for nl in range(2, self.num_hidden_layers + 2):
-            print(f"layer{nl}")
             setattr(self, "layer{}".format(nl), nn.Linear(self.hidden_dim, self.hidden_dim))
         for nl in range(num_hidden_layers+2):
             nn.init.xavier_uniform_(getattr(self, "layer{}".format(nl)).weight)

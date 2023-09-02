@@ -42,7 +42,7 @@ def parse_args(args=None):
 
     parser.add_argument('--data_path', type=str, default=None, help="KG data path")
     parser.add_argument('-n', '--negative_sample_size', default=128, type=int, help="negative entities sampled per query")
-    parser.add_argument('-d', '--hidden_dim', default=500, type=int, help="embedding dimension")
+    parser.add_argument('-d', '--hidden_dim', default=100, type=int, help="embedding dimension")
     parser.add_argument('-g', '--gamma', default=0.5, type=float, help="margin in the loss")
     parser.add_argument('-b', '--batch_size', default=1024, type=int, help="batch size of queries")
     parser.add_argument('--test_batch_size', default=1, type=int, help='valid/test batch size')
@@ -88,8 +88,8 @@ def parse_args(args=None):
     parser.add_argument('--gamma_coff', default=20, type=float, help='coefficient for gamma')
     parser.add_argument('-k', '--prob_dim', default=8, type=int, help="for matrix_softmax and matrix_L1. dims per prob vector")
     parser.add_argument('--godel_gumbel_beta', default=0.01, type=int, help="Gumbel beta for min/max computation when logic=godel_gumbel")
-    parser.add_argument('--loss_type', default='cos', type=str,
-                        choices=['cos', 
+    parser.add_argument('--loss_type', default='possibility', type=str,
+                        choices=['cos', 'possibility',
                                  'cos_digits', 'L1_cos_digits', 'dot_layernorm_digits',
                                  'dot', 'weighted_dot',
                                  'soft_min_digits',
@@ -180,7 +180,7 @@ def main(args):
 
     # logger
     set_logger(args)
-
+    print(args.data_path)
     nentity, nrelation = read_num_entity_relation_from_file(args.data_path)
     args.nentity, args.nrelation = nentity, nrelation
     wandb.log({'nentity': nentity, 'nrelation': nrelation})
@@ -205,6 +205,7 @@ def main(args):
             hidden_dim=args.hidden_dim,
             gamma=args.gamma,
             geo=args.geo,
+            n_partitions=args.n_partitions,
             use_cuda=args.cuda,
             box_mode=eval_tuple(args.box_mode),
             beta_mode=eval_tuple(args.beta_mode),

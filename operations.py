@@ -11,13 +11,13 @@ Entity mapping: takes entity embeddings and map them into a PL-Fuzzy set in [0,1
 class EntityMapping(nn.Module):
     def __init__(self, entity_dim, hidden_dim, 
                  num_hidden_layers,
-                 regularizer_setting,
+                 regularizer,
                  n_partitions):
         super(EntityMapping, self).__init__()
         self.entity_dim = entity_dim
         self.hidden_dim = hidden_dim
         self.num_hidden_layers = num_hidden_layers
-        self.regularizer = regularizer_setting
+        self.regularizer = regularizer
         self.n_partitions = n_partitions
         
         self.pl_fuzzyset_maps = nn.ModuleList([
@@ -31,7 +31,6 @@ class EntityMapping(nn.Module):
             pl_fuzzyset_i = self.pl_fuzzyset_maps[i](e_embedding)
             pl_fuzzyset.append(pl_fuzzyset_i) # (B,1)
         return torch.stack(pl_fuzzyset).squeeze().T
-    
 
 """
 For better Debugging purpose, write two classes
@@ -48,7 +47,7 @@ class ProjectionMLP(nn.Module):
             n_partitions, # for plfuzzyset
             strict_partition, # for plfuzzy set
     ):
-        super(Projection, self).__init__()
+        super(ProjectionMLP, self).__init__()
         self.regularizer = get_regularizer(regularizer_setting, n_partitions, neg_input_possible=True)
         self.relation_dim = relation_dim # TODO: should relation_dim = n_partitions? 
         self.strict_partition = strict_partition
@@ -95,21 +94,22 @@ class ProjectionRelBasis(nn.Module):
             nrelation,
             regularizer_setting,
             relation_dim,
+            projection_dim,
             n_partitions, # for plfuzzyset
     ):
-        super(Projection, self).__init__()
+        super(ProjectionRelBasis, self).__init__()
         self.regularizer = get_regularizer(regularizer_setting, n_partitions, neg_input_possible=True)
         self.relation_dim = relation_dim
         self.dual = regularizer_setting['dual']
         self.n_partitions = n_partitions
-
+        self.hidden_dim = n_partitions  # TODO: degree of freedom
+        
         # partition  vs. non-partition
-        n_base = n_partitions
+        n_base = n_partitions // 10
         if not self.dual:
-            self.hidden_dim = n_partitions
-            self.rel_base = nn.Parameter(torch.zeros(n_partitions, self.hidden_dim, self.hidden_dim))
-            self.rel_bias = nn.Parameter(torch.zeros(n_partitions, self.hidden_dim))
-            self.rel_att = nn.Parameter(torch.zeros(nrelation, n_base))
+            self.rel_base = nn.Parameter(torch.zeros(n_base, self.hidden_dim, self.hidden_dim))
+            self.rel_bias = nn.Parameter(torch.zeros(n_base, self.hidden_dim))
+            self.rel_att = nn.Parameter(torch.zeros(nrelation, n_base)) # 474,500
             self.norm = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
 
             # new initialization
@@ -118,7 +118,7 @@ class ProjectionRelBasis(nn.Module):
             torch.nn.init.xavier_normal_(self.rel_att)
 
         else:
-            self.hidden_dim = self.n_partitions // 2
+            self.hidden_dim = self.hidden_dim // 2
 
             # for property vals
             self.rel_base1 = nn.Parameter(torch.randn(n_base, self.hidden_dim, self.hidden_dim))
@@ -187,7 +187,7 @@ class Projection(nn.Module):
                                                 projection_dim=projection_dim, n_partitions=n_partitions, strict_partition=strict_partition)
         else:
             self.projection_net = ProjectionRelBasis(nrelation=nrelation, regularizer_setting=regularizer_setting, 
-                                                     relation_dim=relation_dim, n_partitions=n_partitions)
+                                                     relation_dim=relation_dim, n_partitions=n_partitions, projection_dim=projection_dim)
 
     def forward(self, e_pl_fuzzyset, rid):
         return self.projection_net(e_pl_fuzzyset, rid)
