@@ -12,25 +12,53 @@ class EntityMapping(nn.Module):
     def __init__(self, entity_dim, hidden_dim, 
                  num_hidden_layers,
                  regularizer,
-                 n_partitions):
+                 n_partitions, modulelist):
         super(EntityMapping, self).__init__()
         self.entity_dim = entity_dim
         self.hidden_dim = hidden_dim
         self.num_hidden_layers = num_hidden_layers
         self.regularizer = regularizer
         self.n_partitions = n_partitions
+        self.modulelist = modulelist
         
-        self.pl_fuzzyset_maps = nn.ModuleList([
-            SimpleMLP(input_dim=self.entity_dim, hidden_dim=self.hidden_dim,
-                      num_hidden_layers=self.num_hidden_layers, regularizer=self.regularizer)
-            for _ in range(self.n_partitions)])
-        
+        if self.modulelist: # this is the case where we use a modulelist
+            self.pl_fuzzyset_maps = nn.ModuleList([
+                SimpleMLP(input_dim=self.entity_dim, hidden_dim=self.hidden_dim,
+                        num_hidden_layers=self.num_hidden_layers, regularizer=self.regularizer)
+                for _ in range(self.n_partitions)])
+        else:
+            self.pl_fuzzyset_maps = SimpleMLP(input_dim=self.entity_dim, hidden_dim=self.hidden_dim,
+                                              num_hidden_layers=self.num_hidden_layers,
+                                              regularizer=self.regularizer,
+                                              output_dim=self.n_partitions) # n_partitions for output_dim 
+    """
+    e_embedding: either one embedding of shape (B,e)
+    or negative samples with shape (B,n,e)
+    returns shape (B,d) or (n,B,d)
+    """
     def forward(self, e_embedding):
-        pl_fuzzyset = []
-        for i in range(self.n_partitions):
-            pl_fuzzyset_i = self.pl_fuzzyset_maps[i](e_embedding)
-            pl_fuzzyset.append(pl_fuzzyset_i) # (B,1)
-        return torch.stack(pl_fuzzyset).squeeze().T
+        # (B,e)
+        # print(f"forward: e_embedding = {e_embedding.shape}")
+        if len(e_embedding.shape) == 2:
+            pl_fuzzyset = []
+            if self.modulelist:
+                for i in range(self.n_partitions):
+                    pl_fuzzyset_i = self.pl_fuzzyset_maps[i](e_embedding)
+                    pl_fuzzyset.append(pl_fuzzyset_i) # (B,1)
+                return torch.stack(pl_fuzzyset).squeeze(-1).T
+            else:
+                return self.pl_fuzzyset_maps(e_embedding)
+        else: # (B,n,e)
+            pl_fuzzyset = []
+            if self.modulelist:
+                for i in range(self.n_partitions):
+                    pl_fuzzyset_i = self.pl_fuzzyset_maps[i](e_embedding) #(B,n,1)
+                    pl_fuzzyset.append(pl_fuzzyset_i) # (d,B,n)
+                return torch.stack(pl_fuzzyset).squeeze(-1).permute(2,1,0)
+            else:
+                return self.pl_fuzzyset_maps(e_embedding).permute(1,0,2)
+            
+            
 
 """
 For better Debugging purpose, write two classes
@@ -46,6 +74,7 @@ class ProjectionMLP(nn.Module):
             projection_dim,
             n_partitions, # for plfuzzyset
             strict_partition, # for plfuzzy set
+            modulelist,
     ):
         super(ProjectionMLP, self).__init__()
         self.regularizer = get_regularizer(regularizer_setting, n_partitions, neg_input_possible=True)
@@ -54,6 +83,8 @@ class ProjectionMLP(nn.Module):
         self.mlp_hidden_dim = projection_dim // n_partitions  # TODO: one degree of freedom
         self.n_partitions = n_partitions
         self.num_layers = num_layers
+        self.modulelist = modulelist
+
         # mlp
         # partition vs. non-partition
         self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.relation_dim))  # same dim
@@ -64,24 +95,34 @@ class ProjectionMLP(nn.Module):
         # one MLP for each partition
         # input as the concatenation of a plfuzzy set and r 
         # here the input_dim can be (a) n_partitions + relation_dim, or (b) 1 + relational_dim
-        self.MLPs = nn.ModuleList([SimpleMLP(input_dim=input_dim,
-                                             hidden_dim=self.mlp_hidden_dim, 
-                                             num_hidden_layers=self.num_layers,
-                                             regularizer=self.regularizer)
-                                   for i in range(self.n_partitions)])
+        if self.modulelist:
+            self.MLPs = nn.ModuleList([SimpleMLP(input_dim=input_dim,
+                                                hidden_dim=self.mlp_hidden_dim, 
+                                                num_hidden_layers=self.num_layers,
+                                                regularizer=self.regularizer)
+                                    for i in range(self.n_partitions)])
+        else: # one MLP for all 
+            self.MLPs = SimpleMLP(input_dim=input_dim, hidden_dim=projection_dim,
+                                  num_hidden_layers=self.num_layers, regularizer=self.regularizer,
+                                  output_dim=self.n_partitions) 
 
+    # e_pl_fuzzyset = (B,1,d)
+    # rid = list of rids 
     def forward(self, e_pl_fuzzyset, rid):
         r_embedding = torch.index_select(self.relation_embedding, dim=0, index=rid)
-        print(r_embedding.shape)
-        print(e_pl_fuzzyset.shape)
-        plfuzzy_set = []
-        for i in range(len(self.MLPs)):
-            if self.strict_partition:
-                plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset[i], r_embedding],dim=-1))
-            else: 
-                plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset, r_embedding], dim=-1))
-            plfuzzy_set.append(plfuzzy_set_i) 
-        plfuzzy_set = torch.stack(plfuzzy_set).squeeze().T  #(B, d)
+        if len(e_pl_fuzzyset.shape) == 3:
+            e_pl_fuzzyset = e_pl_fuzzyset.squeeze(1)
+        if self.modulelist:
+            plfuzzy_set = []
+            for i in range(len(self.MLPs)):
+                if self.strict_partition:
+                    plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset[i], r_embedding],dim=-1))
+                else: 
+                    plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset, r_embedding], dim=-1))
+                plfuzzy_set.append(plfuzzy_set_i)
+            plfuzzy_set = torch.stack(plfuzzy_set).squeeze().T  #(B, d)
+        else:
+            plfuzzy_set = self.MLPs(torch.cat([e_pl_fuzzyset, r_embedding],dim=-1))
         return plfuzzy_set
 
 
@@ -136,6 +177,8 @@ class ProjectionRelBasis(nn.Module):
 
 
     def forward(self, e_pl_fuzzyset, rid):
+        if len(e_pl_fuzzyset.shape) == 3:
+            e_pl_fuzzyset = e_pl_fuzzyset.squeeze(1)
         if not self.dual:
             project_r = torch.einsum('br,rio->bio', self.rel_att[rid], self.rel_base)
             if self.rel_bias.shape[0] == self.rel_base.shape[0]:
@@ -177,6 +220,7 @@ class Projection(nn.Module):
             projection_type,
             n_partitions, # for plfuzzyset
             strict_partition, # for plfuzzy set
+            modulelist,
     ):
         super(Projection, self).__init__()
 
@@ -184,11 +228,16 @@ class Projection(nn.Module):
         if projection_type == 'mlp':
             self.projection_net = ProjectionMLP(nrelation=nrelation, regularizer_setting=regularizer_setting, 
                                                 relation_dim=relation_dim, num_layers=num_layers,
-                                                projection_dim=projection_dim, n_partitions=n_partitions, strict_partition=strict_partition)
+                                                projection_dim=projection_dim, n_partitions=n_partitions, 
+                                                strict_partition=strict_partition, modulelist=modulelist)
         else:
             self.projection_net = ProjectionRelBasis(nrelation=nrelation, regularizer_setting=regularizer_setting, 
                                                      relation_dim=relation_dim, n_partitions=n_partitions, projection_dim=projection_dim)
 
+    """
+    e_pl_fuzzyset = (B,1,d) 
+    squeeze it inside the subroutines 
+    """
     def forward(self, e_pl_fuzzyset, rid):
         return self.projection_net(e_pl_fuzzyset, rid)
 

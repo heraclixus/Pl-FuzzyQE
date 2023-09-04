@@ -701,14 +701,14 @@ the goal is to return a fuzzy embedding (in fuzzyqe)
 or i-th partition of a PL-Fuzzyset (our case)
 """
 class SimpleMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_hidden_layers, regularizer):
+    def __init__(self, input_dim, hidden_dim, num_hidden_layers, regularizer, output_dim=1):
         super(SimpleMLP, self).__init__()
         self.hidden_dim = hidden_dim
         self.input_dim = input_dim
         self.num_hidden_layers = num_hidden_layers
         self.regularizer = regularizer
         self.layer1 = nn.Linear(self.input_dim, self.hidden_dim)  # 1st layer
-        self.layer0 = nn.Linear(self.hidden_dim, 1)  # final projection
+        self.layer0 = nn.Linear(self.hidden_dim, output_dim)  # final projection
         
         for nl in range(2, self.num_hidden_layers + 2):
             setattr(self, "layer{}".format(nl), nn.Linear(self.hidden_dim, self.hidden_dim))

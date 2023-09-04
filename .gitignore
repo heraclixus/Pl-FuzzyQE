@@ -2,3 +2,5 @@ trained_models
 data
 __pycache__
 wandb
+*.txt
+.nfs*

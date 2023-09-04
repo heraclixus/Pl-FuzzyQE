@@ -144,13 +144,15 @@ def parse_args(args=None):
     # partition-based fuzzy set 
     # this corresponds to the hidden_dim parameter before, but now with different interpretation/meaning
     parser.add_argument("--n_partitions", default=100, type=int)
-    parser.add_argument("--strict_partition", action="store_false", help="determines whether map + projection are dimension-wise only")
+    parser.add_argument("--strict_partition", action="store_true", help="determines whether map + projection are dimension-wise only")
     parser.add_argument("--n_hidden_layers", default=2, type=int) # nlayers for mlp
+    parser.add_argument("--modulelist", action="store_true", help="determine if a module list of mlps should be used")
 
     return parser.parse_args(args)
 
 
 def main(args):
+    print(args)
     run = wandb_initialize(vars(args))
     run.save()
     print(f'Wandb run name: {run.name}')
@@ -206,6 +208,7 @@ def main(args):
             gamma=args.gamma,
             geo=args.geo,
             n_partitions=args.n_partitions,
+            modulelist=args.modulelist,
             use_cuda=args.cuda,
             box_mode=eval_tuple(args.box_mode),
             beta_mode=eval_tuple(args.beta_mode),
@@ -388,15 +391,15 @@ def main(args):
 
                 print(f'Time to train {args.log_steps} step: {time.time() - time0:.2f}')
 
-                # # debug parameter change
-                if args.projection_type == 'mlp':
-                    wandb.log({
-                        'projection_layer00': model.projection_net.layer0.weight[0,0]
-                    })
-                if args.regularizer == 'sigmoid':
-                    wandb.log({
-                        'conjunction_regularizer': model.conjunction_net.regularizer.weight[0]
-                    })
+                # # # debug parameter change
+                # if args.projection_type == 'mlp':
+                #     wandb.log({
+                #         'projection_layer00': model.projection_net.layer0.weight[0,0]
+                #     })
+                # if args.regularizer == 'sigmoid':
+                #     wandb.log({
+                #         'conjunction_regularizer': model.conjunction_net.regularizer.weight[0]
+                #     })
 
                 cur_lr = optimizer.param_groups[0]['lr']
                 # print('Change learning_rate to %f at step %d' % (current_learning_rate, step))

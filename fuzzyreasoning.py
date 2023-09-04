@@ -11,7 +11,7 @@ import torch.nn.functional as F
 class KGFuzzyReasoning(KGReasoning):
     def __init__(
         self, nentity, nrelation, hidden_dim, gamma,
-        geo, n_partitions, test_batch_size=1,
+        geo, n_partitions, modulelist, test_batch_size=1,
         box_mode=None, use_cuda=False,
         query_name_dict=None, beta_mode=None,
         logic_type='product',
@@ -32,7 +32,7 @@ class KGFuzzyReasoning(KGReasoning):
                                                query_name_dict, beta_mode)
 
         self.device = device
-
+        self.modulelist = modulelist
         # embedding
         self.hidden_dim = hidden_dim
         self.epsilon = 2.0
@@ -94,7 +94,8 @@ class KGFuzzyReasoning(KGReasoning):
             hidden_dim=hidden_dim,
             num_hidden_layers=args.n_hidden_layers,
             regularizer=self.entity_regularizer,
-            n_partitions=self.n_partitions
+            n_partitions=self.n_partitions,
+            modulelist=self.modulelist
         )
 
         # intersection and projectizAaz<>on
@@ -108,7 +109,8 @@ class KGFuzzyReasoning(KGReasoning):
             num_layers,
             projection_type,
             self.n_partitions,
-            args.strict_partition
+            args.strict_partition,
+            modulelist=self.modulelist
         )
 
         self.conjunction_net = Conjunction(self.entity_dim, logic_type, regularizer_setting, use_attention=args.use_attention, godel_gumbel_beta=godel_gumbel_beta)
@@ -235,8 +237,8 @@ class KGFuzzyReasoning(KGReasoning):
                         ).unsqueeze(1)
                     )
                 positive_pl_fuzzyset = self.entity_map(positive_embedding)
-                print(f"positive_embedding = {positive_embedding.shape}, positive_pl_fuzzyset = {positive_pl_fuzzyset.shape}")
-                print(f"all_pl_fuzzyset = {all_pl_fuzzysets.shape}")
+                # print(f"positive_embedding = {positive_embedding.shape}, positive_pl_fuzzyset = {positive_pl_fuzzyset.shape}")
+                # print(f"all_pl_fuzzyset = {all_pl_fuzzysets.shape}")
                 positive_score = self.cal_logit_fuzzy(positive_pl_fuzzyset, all_pl_fuzzysets, inference=inference)
             else:
                 positive_score = torch.Tensor([]).to(self.device)
@@ -282,8 +284,8 @@ class KGFuzzyReasoning(KGReasoning):
                     )
                 # negative_embedding: (batch_size, n_samples, embed_dim)
                 negative_pl_fuzzyset = self.entity_map(negative_embedding)
-                print(f"negative_embedding = {negative_embedding.shape}, negative_pl_fuzzyset = {negative_pl_fuzzyset.shape}")
-                print(f"all_pl_fuzzyset = {all_pl_fuzzysets.shape}")
+                # print(f"negative_embedding = {negative_embedding.shape}, negative_pl_fuzzyset = {negative_pl_fuzzyset.shape}")
+                # print(f"all_pl_fuzzyset = {all_pl_fuzzysets.shape}")
                 # random negative samples
                 negative_score = self.cal_logit_fuzzy(negative_pl_fuzzyset, all_pl_fuzzysets, inference=inference)
             else:
@@ -338,6 +340,7 @@ class KGFuzzyReasoning(KGReasoning):
                             torch.index_select(self.entity_embedding, dim=0, index=queries[:, idx])
                         )
                 # convert entity embedding into plfuzzy set
+                # print(f"embedding = {embedding.shape}")
                 entity_pl_fuzzyset = self.entity_map(embedding)
                 # print(f"relation recursive 1: entity_pl_fuzzyset = {entity_pl_fuzzyset.shape}")
                 idx += 1  # move to next element (next column in queries)
@@ -402,10 +405,7 @@ class KGFuzzyReasoning(KGReasoning):
     """
     def cal_pl_fuzzy_possibility(self, entity_pl_fuzzyset, query_pl_fuzzyset):
         query_pl_fuzzyset = query_pl_fuzzyset.squeeze() # (B,d)
-        print(query_pl_fuzzyset.shape)
-        if len(entity_pl_fuzzyset.shape) == 2:
-            entity_pl_fuzzyset = entity_pl_fuzzyset.unsqueeze(0) # (1,B,d)
-        print(entity_pl_fuzzyset.shape)
+        # print(entity_pl_fuzzyset.shape)
         intersection_pl_fuzzyset = [self.conjunction_net(torch.stack([entity_pl_fuzzyset[i], query_pl_fuzzyset])) for i in range(len(entity_pl_fuzzyset))] 
         intersection_pl_fuzzyset = torch.stack(intersection_pl_fuzzyset) # (n,B,d)
         partition_weights = self.partition_weights_softmax(self.partition_weights)
@@ -418,7 +418,7 @@ class KGFuzzyReasoning(KGReasoning):
     def cal_logit_fuzzy(self, entity_pl_fuzzyset, query_pl_fuzzyset, inference=False):
         """
         define scoring function for loss
-        :param entity_pl_fuzzyset: shape [batch_size, 1, dim] (positive), [batch_size, num_neg, dim] (negative)
+        :param entity_pl_fuzzyset: shape [1, batch_size, dim] (positive), [num_neg, batch_size, dim] (negative)
         :param query_pl_fuzzyset:　shape [batch_size, 1, dim]
         :param inference: for discrete case, use soft for training and hard for inference
         :return score: shape [batch_size, 1] for positive, [batch_size, num_neg] for negative
@@ -426,6 +426,9 @@ class KGFuzzyReasoning(KGReasoning):
         # TODO: what does "inference=False" mean? 
         if self.loss_type == "possibility":
             return self.cal_pl_fuzzy_possibility(entity_pl_fuzzyset, query_pl_fuzzyset)
+        
+        # otherwise we need to put the batch size first
+        entity_pl_fuzzyset = entity_pl_fuzzyset.permute(1,0,2)
             
         cos = nn.CosineSimilarity(dim=-1)
         if self.loss_type == 'gumbel_softmax':  # regularizer must start with 'matrix'
