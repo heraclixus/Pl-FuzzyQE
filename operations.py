@@ -21,11 +21,16 @@ class EntityMapping(nn.Module):
         self.n_partitions = n_partitions
         self.modulelist = modulelist
         
-        if self.modulelist: # this is the case where we use a modulelist
-            self.pl_fuzzyset_maps = nn.ModuleList([
-                SimpleMLP(input_dim=self.entity_dim, hidden_dim=self.hidden_dim,
-                        num_hidden_layers=self.num_hidden_layers, regularizer=self.regularizer)
-                for _ in range(self.n_partitions)])
+        # parallel einsum w.r.t partitions
+        if self.modulelist:
+            self.hidden_dim = self.hidden_dim
+            self.mapping_weights1 = nn.Parameter(torch.ones((self.n_partitions, self.entity_dim, self.hidden_dim)))
+            # (h, 1)
+            self.mapping_weights2 = nn.Parameter(torch.ones((self.n_partitions, self.hidden_dim, 1)))
+            self.relu = torch.relu
+            self.sigmoid = torch.sigmoid
+            nn.init.uniform_(tensor=self.mapping_weights1, a=0, b=1)
+            nn.init.uniform_(tensor=self.mapping_weights2, a=0, b=1)
         else:
             self.pl_fuzzyset_maps = SimpleMLP(input_dim=self.entity_dim, hidden_dim=self.hidden_dim,
                                               num_hidden_layers=self.num_hidden_layers,
@@ -42,19 +47,17 @@ class EntityMapping(nn.Module):
         if len(e_embedding.shape) == 2:
             pl_fuzzyset = []
             if self.modulelist:
-                for i in range(self.n_partitions):
-                    pl_fuzzyset_i = self.pl_fuzzyset_maps[i](e_embedding)
-                    pl_fuzzyset.append(pl_fuzzyset_i) # (B,1)
-                return torch.stack(pl_fuzzyset).squeeze(-1).T
+                e_embedding = e_embedding.unsqueeze(1).repeat(1,self.n_partitions, 1)        
+                inter_embedding = self.relu(torch.einsum("bde,deh->bdh",e_embedding, self.mapping_weights1))
+                return self.sigmoid(torch.einsum("bdh,dhl->bd", inter_embedding, self.mapping_weights2))
             else:
                 return self.pl_fuzzyset_maps(e_embedding)
         else: # (B,n,e)
             pl_fuzzyset = []
             if self.modulelist:
-                for i in range(self.n_partitions):
-                    pl_fuzzyset_i = self.pl_fuzzyset_maps[i](e_embedding) #(B,n,1)
-                    pl_fuzzyset.append(pl_fuzzyset_i) # (d,B,n)
-                return torch.stack(pl_fuzzyset).squeeze(-1).permute(2,1,0)
+                e_embedding = e_embedding.unsqueeze(1).repeat(1,self.n_partitions, 1, 1)
+                inter_embedding = self.relu(torch.einsum("bdne,deh->bdnh", e_embedding, self.mapping_weights1))
+                return self.sigmoid(torch.einsum("bdnh,dhl->bnd", inter_embedding, self.mapping_weights2)).permute(1,0,2)
             else:
                 return self.pl_fuzzyset_maps(e_embedding).permute(1,0,2)
             
@@ -80,11 +83,10 @@ class ProjectionMLP(nn.Module):
         self.regularizer = get_regularizer(regularizer_setting, n_partitions, neg_input_possible=True)
         self.relation_dim = relation_dim # TODO: should relation_dim = n_partitions? 
         self.strict_partition = strict_partition
-        self.mlp_hidden_dim = projection_dim // n_partitions  # TODO: one degree of freedom
+        self.mlp_hidden_dim = projection_dim // n_partitions * 10  # TODO: one degree of freedom
         self.n_partitions = n_partitions
         self.num_layers = num_layers
         self.modulelist = modulelist
-
         # mlp
         # partition vs. non-partition
         self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.relation_dim))  # same dim
@@ -96,11 +98,14 @@ class ProjectionMLP(nn.Module):
         # input as the concatenation of a plfuzzy set and r 
         # here the input_dim can be (a) n_partitions + relation_dim, or (b) 1 + relational_dim
         if self.modulelist:
-            self.MLPs = nn.ModuleList([SimpleMLP(input_dim=input_dim,
-                                                hidden_dim=self.mlp_hidden_dim, 
-                                                num_hidden_layers=self.num_layers,
-                                                regularizer=self.regularizer)
-                                    for i in range(self.n_partitions)])
+            self.mapping_weights1 = nn.Parameter(torch.ones((self.n_partitions, input_dim, self.mlp_hidden_dim)))
+            # (h, 1)
+            self.mapping_weights2 = nn.Parameter(torch.ones((self.n_partitions, self.mlp_hidden_dim, 1)))
+            self.relu = torch.relu
+            self.sigmoid = torch.sigmoid
+            nn.init.xavier_uniform_(self.mapping_weights1)
+            nn.init.xavier_uniform_(self.mapping_weights2)
+            
         else: # one MLP for all 
             self.MLPs = SimpleMLP(input_dim=input_dim, hidden_dim=projection_dim,
                                   num_hidden_layers=self.num_layers, regularizer=self.regularizer,
@@ -113,14 +118,10 @@ class ProjectionMLP(nn.Module):
         if len(e_pl_fuzzyset.shape) == 3:
             e_pl_fuzzyset = e_pl_fuzzyset.squeeze(1)
         if self.modulelist:
-            plfuzzy_set = []
-            for i in range(len(self.MLPs)):
-                if self.strict_partition:
-                    plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset[i], r_embedding],dim=-1))
-                else: 
-                    plfuzzy_set_i = self.MLPs[i](torch.cat([e_pl_fuzzyset, r_embedding], dim=-1))
-                plfuzzy_set.append(plfuzzy_set_i)
-            plfuzzy_set = torch.stack(plfuzzy_set).squeeze().T  #(B, d)
+            input = torch.cat([e_pl_fuzzyset, r_embedding], dim=-1) # (B,d+r)
+            input_rep = input.unsqueeze(1).repeat(1,self.n_partitions, 1)   # (B,d,d+r)     
+            inter_embedding = self.relu(torch.einsum("bdr,drh->bdh",input_rep, self.mapping_weights1))
+            plfuzzy_set = self.sigmoid(torch.einsum("bdh,dhl->bd", inter_embedding, self.mapping_weights2))
         else:
             plfuzzy_set = self.MLPs(torch.cat([e_pl_fuzzyset, r_embedding],dim=-1))
         return plfuzzy_set

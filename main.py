@@ -146,7 +146,7 @@ def parse_args(args=None):
     parser.add_argument("--n_partitions", default=100, type=int)
     parser.add_argument("--strict_partition", action="store_true", help="determines whether map + projection are dimension-wise only")
     parser.add_argument("--n_hidden_layers", default=2, type=int) # nlayers for mlp
-    parser.add_argument("--modulelist", action="store_true", help="determine if a module list of mlps should be used")
+    parser.add_argument("--modulelist", action="store_true", help="determine if a list of mlps should be used")
 
     return parser.parse_args(args)
 
