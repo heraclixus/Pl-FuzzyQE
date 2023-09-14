@@ -229,6 +229,7 @@ def main(args):
             godel_gumbel_beta=args.godel_gumbel_beta,
             gumbel_temperature=args.gumbel_temperature,
             projection_type=args.projection_type,
+            n_rel_base=args.num_rel_base,
             args=args
         )
     else:

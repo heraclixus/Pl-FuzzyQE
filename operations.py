@@ -136,7 +136,7 @@ class ProjectionRelBasis(nn.Module):
             nrelation,
             regularizer_setting,
             relation_dim,
-            projection_dim,
+            n_basis,
             n_partitions, # for plfuzzyset
     ):
         super(ProjectionRelBasis, self).__init__()
@@ -147,7 +147,7 @@ class ProjectionRelBasis(nn.Module):
         self.hidden_dim = n_partitions  # TODO: degree of freedom
         
         # partition  vs. non-partition
-        n_base = n_partitions // 10
+        n_base = n_basis
         if not self.dual:
             self.rel_base = nn.Parameter(torch.zeros(n_base, self.hidden_dim, self.hidden_dim))
             self.rel_bias = nn.Parameter(torch.zeros(n_base, self.hidden_dim))
@@ -219,6 +219,7 @@ class Projection(nn.Module):
             projection_dim,
             num_layers,
             projection_type,
+            n_basis,
             n_partitions, # for plfuzzyset
             strict_partition, # for plfuzzy set
             modulelist,
@@ -233,7 +234,7 @@ class Projection(nn.Module):
                                                 strict_partition=strict_partition, modulelist=modulelist)
         else:
             self.projection_net = ProjectionRelBasis(nrelation=nrelation, regularizer_setting=regularizer_setting, 
-                                                     relation_dim=relation_dim, n_partitions=n_partitions, projection_dim=projection_dim)
+                                                     relation_dim=relation_dim, n_partitions=n_partitions, n_basis=n_basis)
 
     """
     e_pl_fuzzyset = (B,1,d) 

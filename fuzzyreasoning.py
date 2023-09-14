@@ -23,6 +23,7 @@ class KGFuzzyReasoning(KGReasoning):
         godel_gumbel_beta=0.01,
         gumbel_temperature=1,
         projection_type='mlp',
+        n_rel_base=30,
         args=None
 
     ):
@@ -45,6 +46,8 @@ class KGFuzzyReasoning(KGReasoning):
         
         # PL-Fuzzyset
         self.n_partitions = n_partitions
+        
+        self.n_rel_base = n_rel_base
 
 
         if args.load_pretrained == True:
@@ -75,7 +78,7 @@ class KGFuzzyReasoning(KGReasoning):
         self.loss_type = loss_type
         self.margin_type = margin_type
         if self.loss_type == 'weighted_dot':
-            self.dim_weight = nn.Parameter(torch.ones((self.entity_dim,)))
+            self.dim_weight = nn.Parameter(torch.ones((self.n_partitions,)))
             self.dim_weight_softmax = nn.Softmax(dim=-1)
 
         if margin_type == 'softmax':
@@ -108,9 +111,10 @@ class KGFuzzyReasoning(KGReasoning):
             projection_dim,
             num_layers,
             projection_type,
+            self.n_rel_base,
             self.n_partitions,
             args.strict_partition,
-            modulelist=self.modulelist
+            modulelist=self.modulelist,
         )
 
         self.conjunction_net = Conjunction(self.entity_dim, logic_type, regularizer_setting, use_attention=args.use_attention, godel_gumbel_beta=godel_gumbel_beta)
@@ -120,6 +124,15 @@ class KGFuzzyReasoning(KGReasoning):
         # weight for each partition
         self.partition_weights = nn.Parameter(torch.ones((self.n_partitions, )))
         self.partition_weights_softmax = nn.Softmax(dim=-1)
+        
+        
+        
+        # 09/13: new derivation for set-dependent weights
+        # this means we have a MLP that takes in a partition-level fuzzy set and returns a weight for partition.
+        # ideally this weight should depend on the fuzzy set membership function m_A
+        # but we noly have mu_A, so here take in the value of mu_A 
+        
+        
         
         # gumbel softmax
         self.gumbel_temperature = gumbel_temperature  # used if loss_type == 'gumbel_softmax'
@@ -134,8 +147,8 @@ class KGFuzzyReasoning(KGReasoning):
         self.in_batch_negative = args.in_batch_negative
 
         if self.loss_type == 'dot_layernorm_digits':
-            self.entity_ln = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
-            self.query_ln = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
+            self.entity_ln = nn.LayerNorm(self.n_partitions, elementwise_affine=False)
+            self.query_ln = nn.LayerNorm(self.n_partitions, elementwise_affine=False)
 
         self.counter_for_neg = args.with_counter  # add \neg q to negative samples
 
@@ -180,9 +193,25 @@ class KGFuzzyReasoning(KGReasoning):
             for i, sample_idx in enumerate(sample_idx_list)
             if np.any(sample_idx)
         }
+        
+        # TODO: temporary debug measure for modulelist case 
+        # batch_queries = [np.array(batch_query, dtype=np.int64) for batch_query in batch_queries]
+        
+        # print(f"debug_1")
+        # print(f"batch_quries = {batch_queries}")
+        # for query_structure, sample_idxs in batch_idxs_dict.items():
+        #     print(f"query_structure = {query_structure}")
+        #     print(f"sample_idxs = {sample_idxs}")
+        #     print(f"batch_queries[sample_dixs] = {batch_queries[sample_idxs[0]]}")            
+        #     print(f"np stack = {np.stack(batch_queries[sample_idxs[0]])}")
+        #     print(f"torch longtensor = {torch.LongTensor(np.stack(batch_queries[sample_idxs[0]]).astype(np.int64))}")
+        # print("debug_1 finished")
 
+
+        # Note, the sample_idx is a tuple where the first item is the np array we want.
+        # explicit conversion to np.int64 to avoid the error in 154
         batch_queries_dict = {
-            query_structure: torch.LongTensor(np.stack(batch_queries[sample_idxs])).to(self.device)
+            query_structure: torch.LongTensor(np.stack(batch_queries[sample_idxs[0]]).astype(np.int64)).to(self.device)
             for query_structure, sample_idxs in batch_idxs_dict.items()
         }
 
@@ -400,16 +429,25 @@ class KGFuzzyReasoning(KGReasoning):
     """
     this function follows the possibility computation
     entity_pl_fuzzyset : (n, B, n_partitions) where n is the number of negative samples for negative
-    query_pl_fuzzyset: (B,1, n_partitions)
+    query_pl_fuzzyset: (1, B, n_partitions)
     return score: shape [batch_size, 1] for positive, [batch_size, num_neg] for negative
     """
     def cal_pl_fuzzy_possibility(self, entity_pl_fuzzyset, query_pl_fuzzyset):
-        query_pl_fuzzyset = query_pl_fuzzyset.squeeze() # (B,d)
-        # print(entity_pl_fuzzyset.shape)
-        intersection_pl_fuzzyset = [self.conjunction_net(torch.stack([entity_pl_fuzzyset[i], query_pl_fuzzyset])) for i in range(len(entity_pl_fuzzyset))] 
-        intersection_pl_fuzzyset = torch.stack(intersection_pl_fuzzyset) # (n,B,d)
-        partition_weights = self.partition_weights_softmax(self.partition_weights)
-        score = torch.sum(intersection_pl_fuzzyset * partition_weights, dim=-1).T # (B,n)
+        if len(query_pl_fuzzyset.shape) == 3: 
+            query_pl_fuzzyset = query_pl_fuzzyset.squeeze(1) # (B,d)
+        # using the product fuzzy logic, accelerate computation by directly using torch.prod
+        intersection_pl_fuzzyset = torch.einsum("nbd,bd->nbd", entity_pl_fuzzyset, query_pl_fuzzyset)
+        
+        # default
+        # partition_weights = self.partition_weights_softmax(self.partition_weights)
+        # score = torch.sum(intersection_pl_fuzzyset * partition_weights, dim=-1).T # (B,n)
+        
+        # experiment 1: remove the partition weight
+        score = torch.sum(intersection_pl_fuzzyset, dim=-1).T
+        
+        # experiment 2: force partition weight to be just 1/d, using mean
+        # score = torch.mean(intersection_pl_fuzzyset, dim=-1).T        
+        
         return score
 
     """
@@ -418,7 +456,7 @@ class KGFuzzyReasoning(KGReasoning):
     def cal_logit_fuzzy(self, entity_pl_fuzzyset, query_pl_fuzzyset, inference=False):
         """
         define scoring function for loss
-        :param entity_pl_fuzzyset: shape [1, batch_size, dim] (positive), [num_neg, batch_size, dim] (negative)
+        :param entity_pl_fuzzyset: shape [batch_size, 1, dim] (positive), [batch_size, num_neg, dim] (negative)
         :param query_pl_fuzzyset:　shape [batch_size, 1, dim]
         :param inference: for discrete case, use soft for training and hard for inference
         :return score: shape [batch_size, 1] for positive, [batch_size, num_neg] for negative
@@ -810,6 +848,16 @@ class KGFuzzyReasoning(KGReasoning):
         with torch.no_grad():
             for negative_sample, queries, queries_unflatten, query_structure_idxs in tqdm(test_dataloader, disable=not args.print_on_screen):
                 # example: query_structures: [('e', ('r',))].  queries: [[1804,4]]. queries_unflatten: [(1804, (4,)]
+                
+                # TODO: temporary debug 
+                # print(f"testing: negative_sample = {negative_sample.shape}")
+                # print("-----------------------------------------------------")
+                # print(f"testing: queries = {queries}")
+                # print("-----------------------------------------------------")
+                # print(f"testing: query_structure_idxs = {query_structure_idxs}")
+                # print("-----------------------------------------------------")
+                
+                
                 if args.cuda:
                     negative_sample = negative_sample.to(device)
 
